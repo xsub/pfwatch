@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # pfwatch.py — PF pflog watcher with GeoIP + background rDNS (persistent cache)
 # Works on OpenBSD (consumes tcpdump on pflog0 and pfctl -ss)
-# (c) 2025
+# (c) 2025 XSUB <subdcc@gmail.com>
 
 import asyncio
 import ipaddress
