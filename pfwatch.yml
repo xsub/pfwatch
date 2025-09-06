@@ -1,0 +1,30 @@
+pflog_interface: pflog0
+tcpdump_path: /sbin/tcpdump
+pfctl_path: /sbin/pfctl
+
+internal_cidrs:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 100.64.0.0/10
+
+geoip_mmdb: /var/db/GeoLite2/GeoLite2-Country.mmdb   # optional
+reverse_dns: true
+rdns_cache_path: /var/db/pfwatch-rdns.json
+rdns_ttl_secs: 86400
+rdns_workers: 16
+rdns_save_secs: 60
+
+refresh_secs: 3
+window_secs: 300
+poll_states: true
+states_poll_secs: 5
+domain_categories:
+  netflix: entertainment
+  youtube: entertainment
+  tiktok: entertainment
+  cloudflare: cdn
+  akamai: cdn
+  amazonaws: cloud
+  google: cloud
+  microsoft: cloud
