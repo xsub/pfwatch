@@ -2,7 +2,7 @@
 # pfwatch.py — PF pflog watcher with:
 # - GeoIP (local mmdb)
 # - background rDNS with persistent JSON cache
-# - PF tables mapping (pfctl -t <table> -T show) -> label/category
+# - YAML ip_map overrides for non-resolvable IPs
 # - PF states snapshot
 # - rolling "top" view
 # OpenBSD compatible
@@ -21,7 +21,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple
 
 # ---------------- GeoIP ----------------
 _GEOIP_READER = None
@@ -159,77 +159,6 @@ class BackgroundResolver:
                 elif st == "failed":  failed += 1
             return fresh, pending, failed, len(self._cache)
 
-# ---------------- PF tables watcher ----------------
-class PFTables:
-    """
-    Periodically polls pfctl -t <table> -T show for configured tables.
-    Each table is associated with a label and optional category.
-    Lookup is O(#tables * entries) via ipaddress membership (fine for small/medium sets).
-    """
-    def __init__(self, pfctl_path: str, items: List[dict], poll_secs: int = 30):
-        self.pfctl_path = pfctl_path
-        self.items_cfg = items[:]  # [{table,label,category?}, ...]
-        self.poll_secs = poll_secs
-        self._lock = threading.Lock()
-        # runtime structure: [{table, label, category, nets:[IPv4Network/IPv6Network or IPv4Address]}]
-        self._sets: List[dict] = []
-
-    def _parse_line(self, ln: str):
-        tok = ln.strip()
-        if not tok: return None
-        # pfctl may output single IPs or CIDRs
-        try:
-            if '/' in tok:
-                return ipaddress.ip_network(tok, strict=False)
-            else:
-                return ipaddress.ip_network(tok + "/32", strict=False) if ':' not in tok else ipaddress.ip_network(tok + "/128", strict=False)
-        except Exception:
-            return None
-
-    async def poll_loop(self):
-        while True:
-            await self._refresh_once()
-            await asyncio.sleep(max(5, self.poll_secs))
-
-    async def _refresh_once(self):
-        new_sets: List[dict] = []
-        for it in self.items_cfg:
-            table = it.get("table")
-            label = it.get("label", table)
-            category = it.get("category", "uncategorized")
-            if not table:
-                continue
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    self.pfctl_path, "-t", table, "-T", "show",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                out, _ = await proc.communicate()
-                nets = []
-                for ln in out.decode("utf-8", errors="replace").splitlines():
-                    n = self._parse_line(ln)
-                    if n is not None:
-                        nets.append(n)
-                new_sets.append({"table": table, "label": label, "category": category, "nets": nets})
-            except Exception as e:
-                # keep going; table may not exist yet
-                continue
-        with self._lock:
-            self._sets = new_sets
-
-    def label_for_ip(self, ip: str) -> Tuple[str, str]:
-        """Return (label, category) if IP is in any table; else ('','')."""
-        try:
-            ipobj = ipaddress.ip_address(ip)
-        except ValueError:
-            return '', ''
-        with self._lock:
-            for entry in self._sets:
-                for net in entry["nets"]:
-                    if ipobj in net:
-                        return entry["label"], entry["category"]
-        return '', ''
-
 # ---------------- tcpdump pflog parsing ----------------
 TCPDUMP_RE = re.compile(
     r'^(?P<ts>\d+\.\d+)\s+.*?:\s+(?P<src>[^ ]+)\s+>\s+(?P<dst>[^:]+):\s*(?P<rest>.*)$'
@@ -293,14 +222,7 @@ class PFWatch:
         self.internal_nets = [ipaddress.ip_network(x) for x in cfg.get('internal_cidrs', [])]
         self.reverse_dns_enabled = bool(cfg.get('reverse_dns', False))
         self.domain_categories = {k.lower(): v for k, v in cfg.get('domain_categories', {}).items()}
-
-        # PF tables mapper
-        self.pf_tables_cfg = cfg.get('ip_tables', []) or []
-        self.pf_tables = PFTables(
-            pfctl_path=os.path.expanduser(cfg.get('pfctl_path', '/sbin/pfctl')),
-            items=self.pf_tables_cfg,
-            poll_secs=int(cfg.get('ip_tables_poll_secs', 30))
-        )
+        self.ip_map = {str(k): str(v) for k, v in cfg.get('ip_map', {}).items()}
 
         # background rDNS with persistence
         self.resolver = BackgroundResolver(
@@ -333,18 +255,14 @@ class PFWatch:
                 return cat
         return "uncategorized"
 
-    def name_and_cat_for_ip(self, ip: str) -> Tuple[str, str]:
-        # 1) PF tables first
-        lbl, cat = self.pf_tables.label_for_ip(ip)
-        if lbl:
-            # if category empty, fallback to categorize_domain on label
-            return lbl, (cat or self.categorize_domain(lbl))
-        # 2) rDNS (cached)
+    def name_for_ip(self, ip: str) -> str:
+        # 1) YAML ip_map override
+        if ip in self.ip_map:
+            return self.ip_map[ip]
+        # 2) rDNS cache
         if self.reverse_dns_enabled:
-            host = self.resolver.get(ip) or ''
-            if host:
-                return host, self.categorize_domain(host)
-        return '', ''
+            return self.resolver.get(ip) or ''
+        return ''
 
     def handle_packet(self, ts: float, src_ip: str, src_port, dst_ip: str, dst_port, proto: str, length: int):
         now = ts
@@ -354,7 +272,7 @@ class PFWatch:
         if src_int and not dst_int:
             self.per_host_out[src_ip].add(now, length)
             self.per_country[ip_to_country(dst_ip)].add(now, length)
-            name, cat = self.name_and_cat_for_ip(dst_ip)
+            name = self.name_for_ip(dst_ip)
             if not name and self.reverse_dns_enabled:
                 self.resolver.submit(dst_ip)
             elif name:
@@ -363,7 +281,7 @@ class PFWatch:
         elif dst_int and not src_int:
             self.per_host_in[dst_ip].add(now, length)
             self.per_country[ip_to_country(src_ip)].add(now, length)
-            name, cat = self.name_and_cat_for_ip(src_ip)
+            name = self.name_for_ip(src_ip)
             if not name and self.reverse_dns_enabled:
                 self.resolver.submit(src_ip)
             elif name:
@@ -499,7 +417,6 @@ async def main():
     cfg.setdefault('rdns_ttl_secs', 24*3600)
     cfg.setdefault('rdns_workers', 16)
     cfg.setdefault('rdns_save_secs', 60)
-    cfg.setdefault('ip_tables_poll_secs', 30)
 
     # expand ~ paths
     for key in ("geoip_mmdb", "rdns_cache_path", "tcpdump_path", "pfctl_path"):
@@ -518,13 +435,11 @@ async def main():
         asyncio.create_task(watcher.run_tcpdump()),
         asyncio.create_task(watcher.poll_states()) if cfg.get('poll_states', False) else None,
         asyncio.create_task(watcher.autosave_rdns()),
-        asyncio.create_task(watcher.pf_tables.poll_loop()) if cfg.get('ip_tables') else None,
     ]
     tasks = [t for t in tasks if t is not None]
 
     try:
         while True:
-            # simple UI loop inline (avoids double clear + tail flicker)
             watcher.render()
             await asyncio.sleep(cfg.get('refresh_secs', 3))
     except asyncio.CancelledError:
