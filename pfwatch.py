@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# pfwatch.py — PF pflog watcher with GeoIP + background rDNS (persistent cache)
-# Works on OpenBSD (consumes tcpdump on pflog0 and pfctl -ss)
-# (c) 2025 XSUB <subdcc@gmail.com>
+# pfwatch.py — PF pflog watcher with GeoIP + background rDNS (persistent cache) + ip_labels
+# OpenBSD: reads tcpdump on pflog0 and pfctl -ss
+# (c) 2025
 
 import asyncio
 import ipaddress
@@ -90,7 +90,7 @@ class BackgroundResolver:
         if not self.enabled or not self.cache_path:
             return
         try:
-            import json, tempfile
+            import json
             now = time.time()
             with self._lock:
                 data = {ip: rec for ip, rec in self._cache.items()
@@ -164,7 +164,7 @@ class BackgroundResolver:
 
 # ---------------- tcpdump pflog parsing ----------------
 # Sample tcpdump line (-n -e -tt -l -i pflog0):
-# 1694036401.123456 rule 12/0(match): pass out on em0: 10.0.0.10.54321 > 1.2.3.4.443: Flags [S], seq ...
+# 1694036401.123456 rule 12/(match): pass out on em0: 10.0.0.10.54321 > 1.2.3.4.443: ...
 TCPDUMP_RE = re.compile(
     r'^(?P<ts>\d+\.\d+)\s+.*?:\s+(?P<src>[^ ]+)\s+>\s+(?P<dst>[^:]+):\s*(?P<rest>.*)$'
 )
@@ -227,6 +227,7 @@ class PFWatch:
         self.internal_nets = [ipaddress.ip_network(x) for x in cfg.get('internal_cidrs', [])]
         self.reverse_dns_enabled = bool(cfg.get('reverse_dns', False))
         self.domain_categories = {k.lower(): v for k, v in cfg.get('domain_categories', {}).items()}
+        self.ip_labels = {str(k): str(v) for k, v in cfg.get('ip_labels', {}).items()}
 
         # background resolver with persistence
         self.resolver = BackgroundResolver(
@@ -259,6 +260,14 @@ class PFWatch:
                 return cat
         return "uncategorized"
 
+    def label_or_rdns(self, ip: str) -> str:
+        """Return label from ip_labels if present, else cached rDNS (if any)."""
+        if ip in self.ip_labels:
+            return self.ip_labels[ip]
+        if self.reverse_dns_enabled:
+            return self.resolver.get(ip) or ''
+        return ''
+
     def handle_packet(self, ts: float, src_ip: str, src_port, dst_ip: str, dst_port, proto: str, length: int):
         now = ts
         src_int = self.is_internal(src_ip)
@@ -268,21 +277,23 @@ class PFWatch:
             # outbound
             self.per_host_out[src_ip].add(now, length)
             self.per_country[ip_to_country(dst_ip)].add(now, length)
-            if self.reverse_dns_enabled:
+
+            name = self.label_or_rdns(dst_ip)
+            if not name and self.reverse_dns_enabled:
                 self.resolver.submit(dst_ip)
-                name = self.resolver.get(dst_ip)  # non-blocking read
-                if name:
-                    self.per_domain[name].add(now, length)
+            elif name:
+                self.per_domain[name].add(now, length)
 
         elif dst_int and not src_int:
             # inbound
             self.per_host_in[dst_ip].add(now, length)
             self.per_country[ip_to_country(src_ip)].add(now, length)
-            if self.reverse_dns_enabled:
+
+            name = self.label_or_rdns(src_ip)
+            if not name and self.reverse_dns_enabled:
                 self.resolver.submit(src_ip)
-                name = self.resolver.get(src_ip)
-                if name:
-                    self.per_domain[name].add(now, length)
+            elif name:
+                self.per_domain[name].add(now, length)
 
         elif src_int and dst_int:
             # internal both ways
@@ -427,6 +438,12 @@ async def main():
     cfg.setdefault('rdns_ttl_secs', 24*3600)
     cfg.setdefault('rdns_workers', 16)
     cfg.setdefault('rdns_save_secs', 60)
+
+    # Expand ~ in config paths that are ours
+    for key in ("geoip_mmdb", "rdns_cache_path", "tcpdump_path", "pfctl_path"):
+        val = cfg.get(key)
+        if isinstance(val, str) and val.startswith("~"):
+            cfg[key] = os.path.expanduser(val)
 
     load_geoip(cfg.get('geoip_mmdb', None))
     watcher = PFWatch(cfg)
