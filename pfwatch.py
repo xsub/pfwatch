@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-# pfwatch.py — PF pflog watcher with GeoIP + background rDNS (persistent cache) + ip_labels
-# OpenBSD: reads tcpdump on pflog0 and pfctl -ss
-# (c) 2025
+# pfwatch.py — PF pflog watcher with:
+# - GeoIP (local mmdb)
+# - background rDNS with persistent JSON cache
+# - PF tables mapping (pfctl -t <table> -T show) -> label/category
+# - PF states snapshot
+# - rolling "top" view
+# OpenBSD compatible
+# (c) 2025 pawel.suchanecki@gmail.com / XSUB
 
 import asyncio
 import ipaddress
@@ -16,12 +21,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
-# ---------------- Optional GeoIP ----------------
+# ---------------- GeoIP ----------------
 _GEOIP_READER = None
 def load_geoip(mmdb_path: Optional[str]):
-    """Load MaxMind GeoLite2 Country DB if provided."""
     global _GEOIP_READER
     if not mmdb_path:
         return
@@ -40,12 +44,8 @@ def ip_to_country(ip: str) -> str:
     except Exception:
         return "??"
 
-# ---------------- Reverse DNS (background, persistent cache) ----------------
+# ---------------- Background rDNS (persistent cache) ----------------
 class BackgroundResolver:
-    """
-    Non-blocking reverse-DNS with persistent, TTL'd cache.
-    Cache entries: ip -> { "name": str, "exp": epoch, "state": "fresh|pending|failed" }
-    """
     def __init__(self, enabled: bool, ttl_secs: int = 24*3600, max_workers: int = 16,
                  cache_path: Optional[str] = None):
         self.enabled = enabled
@@ -55,7 +55,6 @@ class BackgroundResolver:
         self._cache: Dict[str, Dict[str, object]] = {}
         self._lock = threading.Lock()
 
-    # ---- lifecycle ----------------------------------------------------------
     def load_from_file(self):
         if not self.enabled or not self.cache_path:
             return
@@ -77,7 +76,7 @@ class BackgroundResolver:
                     except Exception:
                         exp = 0.0
                     st = rec.get("state", "failed")
-                    if exp > now and st in ("fresh", "failed"):  # drop old/pending
+                    if exp > now and st in ("fresh", "failed"):
                         self._cache[ip] = {"name": name, "exp": exp, "state": st}
                         kept += 1
             print(f"[rdns] loaded {kept} entries from {self.cache_path}")
@@ -110,7 +109,6 @@ class BackgroundResolver:
             if self.executor:
                 self.executor.shutdown(wait=False)
 
-    # ---- API ----------------------------------------------------------
     def _now(self) -> float: return time.time()
 
     def _is_fresh(self, rec: Dict[str, object]) -> bool:
@@ -132,8 +130,7 @@ class BackgroundResolver:
         with self._lock:
             rec = self._cache.get(ip)
             if rec and float(rec.get("exp", 0)) > now and rec.get("state") in ("fresh", "pending"):
-                return  # good or in-flight
-            # mark pending with short TTL to avoid stampede
+                return
             self._cache[ip] = {"name": "", "exp": now + 60, "state": "pending"}
         self.executor.submit(self._resolve_and_store, ip)
 
@@ -146,7 +143,7 @@ class BackgroundResolver:
         except Exception:
             name, state = "", "failed"
         with self._lock:
-            ttl = self.ttl_secs if state == "fresh" else 15 * 60  # cache failures 15m
+            ttl = self.ttl_secs if state == "fresh" else 15 * 60
             self._cache[ip] = {"name": name, "exp": self._now() + ttl, "state": state}
 
     def stats(self) -> Tuple[int, int, int, int]:
@@ -162,9 +159,78 @@ class BackgroundResolver:
                 elif st == "failed":  failed += 1
             return fresh, pending, failed, len(self._cache)
 
+# ---------------- PF tables watcher ----------------
+class PFTables:
+    """
+    Periodically polls pfctl -t <table> -T show for configured tables.
+    Each table is associated with a label and optional category.
+    Lookup is O(#tables * entries) via ipaddress membership (fine for small/medium sets).
+    """
+    def __init__(self, pfctl_path: str, items: List[dict], poll_secs: int = 30):
+        self.pfctl_path = pfctl_path
+        self.items_cfg = items[:]  # [{table,label,category?}, ...]
+        self.poll_secs = poll_secs
+        self._lock = threading.Lock()
+        # runtime structure: [{table, label, category, nets:[IPv4Network/IPv6Network or IPv4Address]}]
+        self._sets: List[dict] = []
+
+    def _parse_line(self, ln: str):
+        tok = ln.strip()
+        if not tok: return None
+        # pfctl may output single IPs or CIDRs
+        try:
+            if '/' in tok:
+                return ipaddress.ip_network(tok, strict=False)
+            else:
+                return ipaddress.ip_network(tok + "/32", strict=False) if ':' not in tok else ipaddress.ip_network(tok + "/128", strict=False)
+        except Exception:
+            return None
+
+    async def poll_loop(self):
+        while True:
+            await self._refresh_once()
+            await asyncio.sleep(max(5, self.poll_secs))
+
+    async def _refresh_once(self):
+        new_sets: List[dict] = []
+        for it in self.items_cfg:
+            table = it.get("table")
+            label = it.get("label", table)
+            category = it.get("category", "uncategorized")
+            if not table:
+                continue
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    self.pfctl_path, "-t", table, "-T", "show",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                out, _ = await proc.communicate()
+                nets = []
+                for ln in out.decode("utf-8", errors="replace").splitlines():
+                    n = self._parse_line(ln)
+                    if n is not None:
+                        nets.append(n)
+                new_sets.append({"table": table, "label": label, "category": category, "nets": nets})
+            except Exception as e:
+                # keep going; table may not exist yet
+                continue
+        with self._lock:
+            self._sets = new_sets
+
+    def label_for_ip(self, ip: str) -> Tuple[str, str]:
+        """Return (label, category) if IP is in any table; else ('','')."""
+        try:
+            ipobj = ipaddress.ip_address(ip)
+        except ValueError:
+            return '', ''
+        with self._lock:
+            for entry in self._sets:
+                for net in entry["nets"]:
+                    if ipobj in net:
+                        return entry["label"], entry["category"]
+        return '', ''
+
 # ---------------- tcpdump pflog parsing ----------------
-# Sample tcpdump line (-n -e -tt -l -i pflog0):
-# 1694036401.123456 rule 12/(match): pass out on em0: 10.0.0.10.54321 > 1.2.3.4.443: ...
 TCPDUMP_RE = re.compile(
     r'^(?P<ts>\d+\.\d+)\s+.*?:\s+(?P<src>[^ ]+)\s+>\s+(?P<dst>[^:]+):\s*(?P<rest>.*)$'
 )
@@ -227,14 +293,21 @@ class PFWatch:
         self.internal_nets = [ipaddress.ip_network(x) for x in cfg.get('internal_cidrs', [])]
         self.reverse_dns_enabled = bool(cfg.get('reverse_dns', False))
         self.domain_categories = {k.lower(): v for k, v in cfg.get('domain_categories', {}).items()}
-        self.ip_labels = {str(k): str(v) for k, v in cfg.get('ip_labels', {}).items()}
 
-        # background resolver with persistence
+        # PF tables mapper
+        self.pf_tables_cfg = cfg.get('ip_tables', []) or []
+        self.pf_tables = PFTables(
+            pfctl_path=os.path.expanduser(cfg.get('pfctl_path', '/sbin/pfctl')),
+            items=self.pf_tables_cfg,
+            poll_secs=int(cfg.get('ip_tables_poll_secs', 30))
+        )
+
+        # background rDNS with persistence
         self.resolver = BackgroundResolver(
             enabled=self.reverse_dns_enabled,
             ttl_secs=int(cfg.get('rdns_ttl_secs', 24*3600)),
             max_workers=int(cfg.get('rdns_workers', 16)),
-            cache_path=cfg.get('rdns_cache_path')
+            cache_path=os.path.expanduser(cfg.get('rdns_cache_path')) if cfg.get('rdns_cache_path') else None
         )
         self.resolver.load_from_file()
 
@@ -260,13 +333,18 @@ class PFWatch:
                 return cat
         return "uncategorized"
 
-    def label_or_rdns(self, ip: str) -> str:
-        """Return label from ip_labels if present, else cached rDNS (if any)."""
-        if ip in self.ip_labels:
-            return self.ip_labels[ip]
+    def name_and_cat_for_ip(self, ip: str) -> Tuple[str, str]:
+        # 1) PF tables first
+        lbl, cat = self.pf_tables.label_for_ip(ip)
+        if lbl:
+            # if category empty, fallback to categorize_domain on label
+            return lbl, (cat or self.categorize_domain(lbl))
+        # 2) rDNS (cached)
         if self.reverse_dns_enabled:
-            return self.resolver.get(ip) or ''
-        return ''
+            host = self.resolver.get(ip) or ''
+            if host:
+                return host, self.categorize_domain(host)
+        return '', ''
 
     def handle_packet(self, ts: float, src_ip: str, src_port, dst_ip: str, dst_port, proto: str, length: int):
         now = ts
@@ -274,29 +352,24 @@ class PFWatch:
         dst_int = self.is_internal(dst_ip)
 
         if src_int and not dst_int:
-            # outbound
             self.per_host_out[src_ip].add(now, length)
             self.per_country[ip_to_country(dst_ip)].add(now, length)
-
-            name = self.label_or_rdns(dst_ip)
+            name, cat = self.name_and_cat_for_ip(dst_ip)
             if not name and self.reverse_dns_enabled:
                 self.resolver.submit(dst_ip)
             elif name:
                 self.per_domain[name].add(now, length)
 
         elif dst_int and not src_int:
-            # inbound
             self.per_host_in[dst_ip].add(now, length)
             self.per_country[ip_to_country(src_ip)].add(now, length)
-
-            name = self.label_or_rdns(src_ip)
+            name, cat = self.name_and_cat_for_ip(src_ip)
             if not name and self.reverse_dns_enabled:
                 self.resolver.submit(src_ip)
             elif name:
                 self.per_domain[name].add(now, length)
 
         elif src_int and dst_int:
-            # internal both ways
             self.per_host_out[src_ip].add(now, length)
             self.per_host_in[dst_ip].add(now, length)
         # external<->external ignored
@@ -333,11 +406,10 @@ class PFWatch:
         for b, p, h in top_n(self.per_host_in, 10):
             print(f"  {h:<15}  {b:>12,}  / {p:>7}")
 
-        if self.reverse_dns_enabled:
-            print("\nTop domains (with categories):")
-            for b, p, dom in top_n(self.per_domain, 10):
-                cat = self.categorize_domain(dom)
-                print(f"  {dom:<40} {b:>12,} / {p:>7}   [{cat}]")
+        print("\nTop domains (with categories):")
+        for b, p, dom in top_n(self.per_domain, 10):
+            cat = self.categorize_domain(dom)
+            print(f"  {dom:<40} {b:>12,} / {p:>7}   [{cat}]")
 
         if self.cfg.get('poll_states', False):
             print("\nActive connections snapshot:")
@@ -348,7 +420,7 @@ class PFWatch:
                 print(f"  ... (+{more} more)")
 
     async def run_tcpdump(self):
-        td = self.cfg.get('tcpdump_path', '/sbin/tcpdump')
+        td = os.path.expanduser(self.cfg.get('tcpdump_path', '/sbin/tcpdump'))
         iface = self.cfg.get('pflog_interface', 'pflog0')
         cmd = [td, '-n', '-e', '-tt', '-l', '-i', iface]
         proc = await asyncio.create_subprocess_exec(
@@ -378,7 +450,7 @@ class PFWatch:
                 continue
 
     async def poll_states(self):
-        pfctl = self.cfg.get('pfctl_path', '/sbin/pfctl')
+        pfctl = os.path.expanduser(self.cfg.get('pfctl_path', '/sbin/pfctl'))
         while True:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -401,7 +473,6 @@ class PFWatch:
             await asyncio.sleep(self.cfg.get('states_poll_secs', 5))
 
     async def autosave_rdns(self):
-        """Periodic persistent save of rDNS cache."""
         interval = int(self.cfg.get('rdns_save_secs', 60))
         if interval <= 0:
             return
@@ -411,16 +482,6 @@ class PFWatch:
                 self.resolver.save_to_file()
         except asyncio.CancelledError:
             pass
-
-    async def ui_loop(self):
-        refresh = self.cfg.get('refresh_secs', 3)
-        try:
-            while True:
-                self.render()
-                await asyncio.sleep(refresh)
-        finally:
-            # save cache and stop threads
-            self.resolver.shutdown()
 
 # ---------------- entrypoint ----------------
 async def main():
@@ -438,8 +499,9 @@ async def main():
     cfg.setdefault('rdns_ttl_secs', 24*3600)
     cfg.setdefault('rdns_workers', 16)
     cfg.setdefault('rdns_save_secs', 60)
+    cfg.setdefault('ip_tables_poll_secs', 30)
 
-    # Expand ~ in config paths that are ours
+    # expand ~ paths
     for key in ("geoip_mmdb", "rdns_cache_path", "tcpdump_path", "pfctl_path"):
         val = cfg.get(key)
         if isinstance(val, str) and val.startswith("~"):
@@ -454,16 +516,21 @@ async def main():
 
     tasks = [
         asyncio.create_task(watcher.run_tcpdump()),
-        asyncio.create_task(watcher.ui_loop()),
+        asyncio.create_task(watcher.poll_states()) if cfg.get('poll_states', False) else None,
         asyncio.create_task(watcher.autosave_rdns()),
+        asyncio.create_task(watcher.pf_tables.poll_loop()) if cfg.get('ip_tables') else None,
     ]
-    if cfg.get('poll_states', False):
-        tasks.append(asyncio.create_task(watcher.poll_states()))
+    tasks = [t for t in tasks if t is not None]
 
     try:
-        await asyncio.gather(*tasks)
+        while True:
+            # simple UI loop inline (avoids double clear + tail flicker)
+            watcher.render()
+            await asyncio.sleep(cfg.get('refresh_secs', 3))
     except asyncio.CancelledError:
         pass
+    finally:
+        watcher.resolver.shutdown()
 
 if __name__ == '__main__':
     try:
