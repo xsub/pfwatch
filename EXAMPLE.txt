@@ -1,0 +1,27 @@
+PF Watch — live (window=300s)  2025-09-08 18:14:26
+================================================================================
+rDNS cache: fresh=48 pending=0 failed=32 total=80
+
+Top countries (bytes / pkts):
+  N/A             0  /     272
+
+Top internal hosts (outbound):
+  199.168.56.23                0  /     167
+  199.168.56.116               0  /      65
+  199.168.56.18                0  /      38
+
+Top internal hosts (inbound):
+  199.168.56.10                0  /      32
+
+Top domains (with categories):
+  google-dns                                          0 /      93   [cloud]
+  truckonline.example.net                             0 /      22   [uncategorized]
+  cloudflare-dns                                      0 /      14   [cdn]
+  waw07s06-in-f3.1e100.net                            0 /       2   [uncategorized]
+  um10.eset.com                                       0 /       2   [uncategorized]
+  93.243.107.34.bc.googleusercontent.com              0 /       2   [cloud]
+
+Active connections snapshot:
+  udp  199.168.143.118:3825  -> cloudflare-dns
+  udp  199.168.143.118:14849 -> cloudflare-dns
+  tcp  199.168.143.118:7803  -> github
