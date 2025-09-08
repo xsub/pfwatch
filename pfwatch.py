@@ -396,7 +396,9 @@ class PFWatch:
                         proto = m.group('proto')
                         src = m.group('src')
                         dst = m.group('dst')
-                        snapshot.append(f"{proto:<4} {src} -> {dst}")
+                        src_name = self.name_for_ip(src.split(':')[0]) or src
+                        dst_name = self.name_for_ip(dst.split(':')[0]) or dst
+                        snapshot.append(f"{proto:<4} {src_name} -> {dst_name}")
                 self.active_states = snapshot
             except Exception:
                 self.active_states = []
