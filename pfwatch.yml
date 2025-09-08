@@ -1,24 +1,23 @@
 pflog_interface: pflog0
-tcpdump_path: /sbin/tcpdump
+tcpdump_path: /usr/sbin/tcpdump
 pfctl_path: /sbin/pfctl
 
 internal_cidrs:
-  - 10.0.0.0/8
-  - 172.16.0.0/12
-  - 192.168.0.0/16
-  - 100.64.0.0/10
+  - 192.168.56.0/24
+  - 192.168.143.0/24
 
-geoip_mmdb: /var/db/GeoLite2/GeoLite2-Country.mmdb   # optional
+geoip_mmdb: /home/pawel/pfwatch/GeoLite2-Country.mmdb   # optional
 reverse_dns: true
-rdns_cache_path: /var/db/pfwatch-rdns.json
+rdns_cache_path: /home/pawel/pfwatch/pfwatch-rdns.json
 rdns_ttl_secs: 86400
 rdns_workers: 16
 rdns_save_secs: 60
 
-refresh_secs: 3
+refresh_secs: 2
 window_secs: 300
 poll_states: true
-states_poll_secs: 5
+states_poll_secs: 3
+
 domain_categories:
   netflix: entertainment
   youtube: entertainment
@@ -28,3 +27,10 @@ domain_categories:
   amazonaws: cloud
   google: cloud
   microsoft: cloud
+
+ip_map:
+  1.1.1.1: cloudflare-dns
+  8.8.8.8: google-dns
+  8.8.4.4: google-dns
+  178.215.228.24: pool.ntp
+  140.82.121.0/24: github
