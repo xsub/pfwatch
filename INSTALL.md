@@ -13,25 +13,40 @@ Reload PF:
 doas pfctl -f /etc/pf.conf
 ```
 
-## 2) Install Python + GeoIP
+## 2) Install Python + dependencies
+
+Install system packages for Python and YAML:
 
 ```sh
-doas pkg_add python%3 py3-geoip2 py3-yaml
+doas pkg_add python%3 py3-yaml
 ```
 
-> 💡 If you prefer, you can skip `geoip2` and the tool will run without countries.
+Create a virtual environment and install `geoip2` via pip (optional, only if you want country lookups):
 
-Get a GeoLite2 Country DB (free, requires a MaxMind account):
+```sh
+python3 -m venv ~/pfwatch-venv
+. ~/pfwatch-venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install geoip2 PyYAML
+```
+
+> 💡 If you skip installing `geoip2`, the tool will still run, but country lookups will show as `N/A`.
+
+## 3) GeoLite2 Country DB
+
+Download the free GeoLite2 Country DB (requires a [MaxMind account](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data)):
 
 - Download `GeoLite2-Country.mmdb`  
 - Place it in e.g. `/var/db/GeoLite2-Country.mmdb`
 
-Save the config from the example `pfwatch.yml` (adjust networks and paths).
+Update your `pfwatch.yml` config to point to this file.
 
 ---
 
 ## Usage
 
 ```sh
-doas python3 pfwatch.py pfwatch.yml
+. ~/pfwatch-venv/bin/activate
+doas python pfwatch.py pfwatch.yml
 ```
