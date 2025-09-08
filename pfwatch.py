@@ -2,7 +2,7 @@
 # pfwatch.py — PF pflog watcher with:
 # - GeoIP (local mmdb)
 # - background rDNS with persistent JSON cache
-# - YAML ip_map overrides for non-resolvable IPs
+# - YAML ip_map overrides (single IP or CIDR) for non-resolvable IPs
 # - PF states snapshot
 # - rolling "top" view
 # OpenBSD compatible
@@ -21,7 +21,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Union
 
 # ---------------- GeoIP ----------------
 _GEOIP_READER = None
@@ -222,7 +222,14 @@ class PFWatch:
         self.internal_nets = [ipaddress.ip_network(x) for x in cfg.get('internal_cidrs', [])]
         self.reverse_dns_enabled = bool(cfg.get('reverse_dns', False))
         self.domain_categories = {k.lower(): v for k, v in cfg.get('domain_categories', {}).items()}
-        self.ip_map = {str(k): str(v) for k, v in cfg.get('ip_map', {}).items()}
+        # ip_map supports single IP or CIDR
+        self.ip_map = []
+        for k, v in cfg.get('ip_map', {}).items():
+            try:
+                net = ipaddress.ip_network(k, strict=False)
+            except Exception:
+                continue
+            self.ip_map.append((net, str(v)))
 
         # background rDNS with persistence
         self.resolver = BackgroundResolver(
@@ -256,10 +263,15 @@ class PFWatch:
         return "uncategorized"
 
     def name_for_ip(self, ip: str) -> str:
-        # 1) YAML ip_map override
-        if ip in self.ip_map:
-            return self.ip_map[ip]
-        # 2) rDNS cache
+        try:
+            ipobj = ipaddress.ip_address(ip)
+        except ValueError:
+            return ''
+        # 1) ip_map
+        for net, label in self.ip_map:
+            if ipobj in net:
+                return label
+        # 2) rDNS
         if self.reverse_dns_enabled:
             return self.resolver.get(ip) or ''
         return ''
@@ -273,19 +285,19 @@ class PFWatch:
             self.per_host_out[src_ip].add(now, length)
             self.per_country[ip_to_country(dst_ip)].add(now, length)
             name = self.name_for_ip(dst_ip)
-            if not name and self.reverse_dns_enabled:
-                self.resolver.submit(dst_ip)
-            elif name:
+            if name:
                 self.per_domain[name].add(now, length)
+            elif self.reverse_dns_enabled:
+                self.resolver.submit(dst_ip)
 
         elif dst_int and not src_int:
             self.per_host_in[dst_ip].add(now, length)
             self.per_country[ip_to_country(src_ip)].add(now, length)
             name = self.name_for_ip(src_ip)
-            if not name and self.reverse_dns_enabled:
-                self.resolver.submit(src_ip)
-            elif name:
+            if name:
                 self.per_domain[name].add(now, length)
+            elif self.reverse_dns_enabled:
+                self.resolver.submit(src_ip)
 
         elif src_int and dst_int:
             self.per_host_out[src_ip].add(now, length)
