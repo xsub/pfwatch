@@ -1,28 +1,35 @@
 # pfwatch
 
-**pfwatch** is a lightweight console tool for OpenBSD administrators who want to
-see *what’s happening right now* on their PF firewall/router.
+**pfwatch** is a lightweight, console-based monitoring tool for **OpenBSD PF**  
+(edge firewalls, routers, gateways).  
 
 It consumes logs from the `pflog0` pseudo-interface (via `tcpdump`) and the PF
-state table (via `pfctl -ss`), then gives you a live "top"-style view:
+state table (via `pfctl -ss`) and displays a live **"top"-style view**:
 
-- **Top countries** by traffic (GeoIP2 lookup)
-- **Internal hosts** with most inbound/outbound traffic
-- **Reverse-DNS resolved domains**, categorized by simple rules
-- **Active PF states** snapshot
-- **Rolling window** stats (default: last 5 minutes)
+- 🌍 **Top countries** by traffic (GeoIP2 lookup)
+- 🖥️ **Top internal hosts** (inbound/outbound, bytes/packets)
+- 🌐 **Domains** (via reverse DNS or static `ip_map`) with categories
+- 🔎 **Active PF states** snapshot
+- ⏱️ **Rolling window statistics** (default: last 5 minutes, configurable)
+
+---
 
 ## Features
 
-- 🛡️ Designed for **OpenBSD PF** (edge routers, firewalls, gateways)
-- 📡 Real-time packet accounting (bytes/packets per direction)
-- 🌍 Optional GeoIP2 country resolution
-- 🔄 **Background-threaded rDNS** resolver:
-  - Non-blocking (never stalls packet processing)
+- 🛡️ Built for **OpenBSD PF** (works directly with `pflog0` + `pfctl`)
+- 📡 Real-time packet accounting (bytes/packets)
+- 🌍 Optional **GeoIP2** country resolution
+- 🔄 **Threaded rDNS resolver**:
+  - Non-blocking (never stalls packet parsing)
   - Results cached with TTL
-  - Cache persisted to JSON on disk (restored across restarts)
-- ⚡ Minimal dependencies (`python3`, `pyyaml`, `geoip2` if you want GeoIP)
-- 🖥️ Runs in the console, no heavy GUI or database required
+  - Cache persisted to JSON across restarts
+- 🗺️ **Static IP/CIDR mapping (`ip_map`)** for addresses without PTR records:
+  - Example: `1.1.1.1 → cloudflare-dns`
+  - Supports whole subnets: `140.82.121.0/24 → github`
+- ⚡ Minimal dependencies: `python3`, `pyyaml`, `geoip2` (optional)
+- 🖥️ Console UI only — no GUI, no DB, no external agents
+
+---
 
 ## Configuration
 
@@ -30,20 +37,38 @@ Configuration is provided in a YAML file, e.g. `pfwatch.yml`:
 
 ```yaml
 pflog_interface: pflog0
-tcpdump_path: /sbin/tcpdump
+tcpdump_path: /usr/sbin/tcpdump
 pfctl_path: /sbin/pfctl
 
 internal_cidrs:
-  - 192.168.0.0/16
-  - 10.0.0.0/8
+  - 192.168.56.0/24
+  - 192.168.143.0/24
 
-geoip_mmdb: /var/db/GeoLite2/GeoLite2-Country.mmdb
+geoip_mmdb: /home/pawel/pfwatch/GeoLite2-Country.mmdb   # optional
 reverse_dns: true
-rdns_cache_path: /var/db/pfwatch-rdns.json
+rdns_cache_path: /home/pawel/pfwatch/pfwatch-rdns.json
 rdns_ttl_secs: 86400
 rdns_workers: 16
 rdns_save_secs: 60
 
-refresh_secs: 3
+refresh_secs: 2
 window_secs: 300
 poll_states: true
+states_poll_secs: 3
+
+domain_categories:
+  netflix: entertainment
+  youtube: entertainment
+  tiktok: entertainment
+  cloudflare: cdn
+  akamai: cdn
+  amazonaws: cloud
+  google: cloud
+  microsoft: cloud
+
+ip_map:
+  1.1.1.1: cloudflare-dns
+  8.8.8.8: google-dns
+  8.8.4.4: google-dns
+  178.215.228.24: pool.ntp
+  140.82.121.0/24: github
