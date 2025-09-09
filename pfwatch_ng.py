@@ -4,7 +4,7 @@
 # - background rDNS with persistent JSON cache
 # - YAML ip_map overrides (single IP or CIDR) for non-resolvable IPs
 # - PF states snapshot
-# - rolling, scrollable “top” view (curses UI)
+# - rolling, scrollable “top” view (curses UI) with IP/fragment filter
 # OpenBSD compatible
 # (c) 2025 pawel.suchanecki@gmail.com / XSUB
 
@@ -250,6 +250,9 @@ class PFWatch:
         self.per_domain   = defaultdict(lambda: RollingCounter(W))
         self.active_states = []
 
+        # UI filter (applied)
+        self.filter_q = ""
+
     def is_internal(self, ip: str) -> bool:
         try:
             ipobj = ipaddress.ip_address(ip)
@@ -307,29 +310,46 @@ class PFWatch:
         # external<->external ignored
 
     # ---------- helpers ----------
-    def _sorted_items(self, counter_map, now):
+    def _match_filter_ip_or_name(self, ip_str: str) -> bool:
+        q = (self.filter_q or "").strip()
+        if not q:
+            return True
+        s = str(ip_str)
+        if q in s:
+            return True
+        nm = self.name_for_ip(s) or ""
+        return q.lower() in nm.lower()
+
+    def _sorted_items(self, counter_map, now, kind="host"):
         items = []
         for k, rc in counter_map.items():
             b, p = rc.snapshot(now)
-            if b or p:
-                items.append((b, p, k))
-        # sort by bytes desc, then pkts desc, then key asc
+            if not (b or p):
+                continue
+            if kind == "host":
+                if not self._match_filter_ip_or_name(k):
+                    continue
+            elif kind == "domain":
+                q = (self.filter_q or "").strip().lower()
+                if q and q not in str(k).lower():
+                    continue
+            items.append((b, p, k))
         items.sort(key=lambda t: (-t[0], -t[1], str(t[2])))
         return items
 
     # ---------- UI sizing (limit panes to ≤ ui_pane_max_ratio of available) ----------
     def _calc_pane_h(self, screen_h: int, pane_start_y: int) -> int:
-        reserved_bottom = 8  # keep space for countries/domains/states/footer
+        reserved_bottom = 8
         available = max(0, screen_h - pane_start_y - reserved_bottom)
         ratio = float(self.cfg.get('ui_pane_max_ratio', 0.5))
-        ratio = min(max(ratio, 0.1), 1.0)  # clamp 10%..100%
+        ratio = min(max(ratio, 0.1), 1.0)
         if available == 0:
             return 0
         pane_h = min(available, int(available * ratio) or available)
         return max(5, pane_h)
 
     # ---------- curses UI ----------
-    def render_curses(self, stdscr, offsets):
+    def render_curses(self, stdscr, offsets, editing_filter: bool, edit_buffer: str):
         now = time.time()
         h, w = stdscr.getmaxyx()
         stdscr.erase()
@@ -351,6 +371,15 @@ class PFWatch:
             safe_add(y, 0, f"rDNS cache: fresh={fr} pending={pn} failed={fl} total={total}")
             y += 1
 
+        # Filter indicator / input
+        filt = self.filter_q.strip()
+        if filt:
+            safe_add(y, 0, f"Filter: {filt}", curses.A_DIM)
+            y += 1
+        if editing_filter:
+            safe_add(y, 0, f"Enter filter (IP/fragment), Enter=apply, Esc=clear: {edit_buffer}", curses.A_BOLD)
+            y += 1
+
         pane_top = y + 1
         safe_add(y, 0, "Outbound (internal → external) — sorted, scroll with Q/A", curses.A_UNDERLINE)
         right_hdr = "Inbound (external → internal) — scroll with W/S"
@@ -361,22 +390,24 @@ class PFWatch:
         right_x = w // 2
         pane_h = self._calc_pane_h(h, pane_top)
 
-        # compute ordered lists
-        out_items = self._sorted_items(self.per_host_out, now)
-        in_items  = self._sorted_items(self.per_host_in,  now)
+        # compute ordered (and filtered) lists
+        out_items = self._sorted_items(self.per_host_out, now, kind="host")
+        in_items  = self._sorted_items(self.per_host_in,  now, kind="host")
 
         def draw_pane(x, items, offset, title_cols=("Host","Bytes","Pkts")):
             hdr = f"{title_cols[0]:<20} {title_cols[1]:>14} / {title_cols[2]:>7}"
             safe_add(pane_top, x, hdr, curses.A_DIM | curses.A_BOLD)
-            visible = items[offset: offset + pane_h]
-            for idx, (b, p, k) in enumerate(visible, start=1):
-                line = f"{str(k):<20.20} {b:>14,} / {p:>7}"
-                safe_add(pane_top + idx, x, line)
-            # scrollbar / status
-            total = len(items)
-            if total > 0:
+            if not items:
+                safe_add(pane_top + 1, x, "(no matches)" if self.filter_q else "(no traffic yet)", curses.A_DIM)
+            else:
+                visible = items[offset: offset + pane_h]
+                for idx, (b, p, k) in enumerate(visible, start=1):
+                    label = self.name_for_ip(k) or str(k)
+                    line = f"{label:<20.20} {b:>14,} / {p:>7}"
+                    safe_add(pane_top + idx, x, line)
+                total = len(items)
                 end = min(offset + pane_h, total)
-                status = f"[{offset+1}-{end}/{total}]"
+                status = f"[{offset+1 if total else 0}-{end}/{total}]"
                 safe_add(pane_top + pane_h + 1, x, status, curses.A_DIM)
 
         draw_pane(left_x,  out_items, offsets['out'])
@@ -384,24 +415,32 @@ class PFWatch:
 
         y = pane_top + pane_h + 3
         safe_add(y, 0, "Top countries (bytes / pkts):", curses.A_UNDERLINE); y += 1
-        for b, p, c in self._sorted_items(self.per_country, now)[:min(10, h - y - 6)]:
+        for b, p, c in self._sorted_items(self.per_country, now, kind="country")[:min(10, h - y - 6)]:
             safe_add(y, 0, f"  {c:>3}  {b:>12,}  / {p:>7}"); y += 1
 
         if y < h - 5:
             safe_add(y, 0, "Top domains (with categories):", curses.A_UNDERLINE); y += 1
             dom_rows_avail = max(0, h - y - 4)
-            for b, p, dom in self._sorted_items(self.per_domain, now)[:dom_rows_avail]:
+            for b, p, dom in self._sorted_items(self.per_domain, now, kind="domain")[:dom_rows_avail]:
                 cat = self.categorize_domain(dom)
                 safe_add(y, 0, f"  {dom:<40.40} {b:>12,} / {p:>7}   [{cat}]"); y += 1
 
         if self.cfg.get('poll_states', False) and y < h - 2:
             safe_add(y, 0, "Active connections snapshot:", curses.A_UNDERLINE); y += 1
-            for line in self.active_states[:max(0, h - y - 1)]:
-                safe_add(y, 2, line); y += 1
+            q = (self.filter_q or "").strip().lower()
+            shown = 0
+            for line in self.active_states:
+                if q and q not in line.lower():
+                    continue
+                if y >= h - 1:
+                    break
+                safe_add(y, 2, line); y += 1; shown += 1
+            if shown == 0:
+                safe_add(y, 2, "(no matches)" if q else "(no data)", curses.A_DIM)
 
-        # footer
         if h > 2:
-            safe_add(h-2, 0, "Keys: Q/A=scroll Outbound  •  W/S=scroll Inbound  •  Ctrl-C to quit", curses.A_DIM)
+            helpmsg = "Keys: Q/A Out • W/S In • '/' filter • Esc clear filter • Ctrl-C quit"
+            safe_add(h-2, 0, helpmsg, curses.A_DIM)
 
         stdscr.refresh()
 
@@ -496,29 +535,60 @@ async def _run_with_curses(stdscr, cfg):
 
     offsets = {'out': 0, 'in': 0}
 
+    # filter editing state
+    editing_filter = False
+    edit_buffer = ""
+    applied_filter = ""
+
     try:
         while True:
-            # keys
             try:
                 ch = stdscr.getch()
                 if ch != -1:
-                    if ch in (ord('q'), ord('Q')):
-                        offsets['out'] = max(0, offsets['out'] - 1)
-                    elif ch in (ord('a'), ord('A')):
-                        offsets['out'] = offsets['out'] + 1
-                    elif ch in (ord('w'), ord('W')):
-                        offsets['in'] = max(0, offsets['in'] - 1)
-                    elif ch in (ord('s'), ord('S')):
-                        offsets['in'] = offsets['in'] + 1
+                    if editing_filter:
+                        if ch in (27,):  # ESC
+                            edit_buffer = ""
+                            applied_filter = ""
+                            watcher.filter_q = ""
+                            editing_filter = False
+                        elif ch in (10, 13):  # Enter
+                            applied_filter = edit_buffer.strip()
+                            watcher.filter_q = applied_filter
+                            editing_filter = False
+                            # reset scroll when filter changes
+                            offsets['out'] = offsets['in'] = 0
+                        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                            edit_buffer = edit_buffer[:-1]
+                        elif 32 <= ch <= 126:
+                            edit_buffer += chr(ch)
+                    else:
+                        if ch in (ord('q'), ord('Q')):
+                            offsets['out'] = max(0, offsets['out'] - 1)
+                        elif ch in (ord('a'), ord('A')):
+                            offsets['out'] = offsets['out'] + 1
+                        elif ch in (ord('w'), ord('W')):
+                            offsets['in'] = max(0, offsets['in'] - 1)
+                        elif ch in (ord('s'), ord('S')):
+                            offsets['in'] = offsets['in'] + 1
+                        elif ch == ord('/'):
+                            editing_filter = True
+                            edit_buffer = watcher.filter_q
 
                 # clamp offsets to list sizes using same pane height logic as renderer
                 now = time.time()
                 h, w = stdscr.getmaxyx()
-                pane_top = 4 if watcher.reverse_dns_enabled else 3
+                base_y = 2
+                if watcher.reverse_dns_enabled:
+                    base_y += 1
+                if watcher.filter_q:
+                    base_y += 1
+                if editing_filter:
+                    base_y += 1
+                pane_top = base_y + 1
                 pane_h = watcher._calc_pane_h(h, pane_top)
 
-                out_len = len(watcher._sorted_items(watcher.per_host_out, now))
-                in_len  = len(watcher._sorted_items(watcher.per_host_in,  now))
+                out_len = len(watcher._sorted_items(watcher.per_host_out, now, kind="host"))
+                in_len  = len(watcher._sorted_items(watcher.per_host_in,  now, kind="host"))
 
                 max_out = max(0, out_len - pane_h)
                 max_in  = max(0, in_len  - pane_h)
@@ -527,7 +597,7 @@ async def _run_with_curses(stdscr, cfg):
             except Exception:
                 pass
 
-            watcher.render_curses(stdscr, offsets)
+            watcher.render_curses(stdscr, offsets, editing_filter, edit_buffer)
             await asyncio.sleep(cfg.get('refresh_secs', 3))
     except asyncio.CancelledError:
         pass
@@ -542,7 +612,6 @@ def _load_cfg_from_argv():
         sys.exit(1)
     with open(sys.argv[1], 'r') as f:
         cfg = yaml.safe_load(f)
-    # defaults
     cfg.setdefault('window_secs', 300)
     cfg.setdefault('refresh_secs', 3)
     cfg.setdefault('poll_states', True)
@@ -550,9 +619,8 @@ def _load_cfg_from_argv():
     cfg.setdefault('rdns_ttl_secs', 24*3600)
     cfg.setdefault('rdns_workers', 16)
     cfg.setdefault('rdns_save_secs', 60)
-    cfg.setdefault('ui', 'curses')            # 'curses' (default) or 'plain'
-    cfg.setdefault('ui_pane_max_ratio', 0.5)  # Outbound/Inbound block ≤ 50% screen height
-    # expand ~ paths
+    cfg.setdefault('ui', 'curses')
+    cfg.setdefault('ui_pane_max_ratio', 0.5)
     for key in ("geoip_mmdb", "rdns_cache_path", "tcpdump_path", "pfctl_path"):
         val = cfg.get(key)
         if isinstance(val, str) and val.startswith("~"):
@@ -560,7 +628,6 @@ def _load_cfg_from_argv():
     return cfg
 
 def _run_plain(cfg):
-    # Minimal fallback; no scrolling
     load_geoip(cfg.get('geoip_mmdb', None))
     watcher = PFWatch(cfg)
 
@@ -596,9 +663,9 @@ def _run_plain(cfg):
                 dump("Inbound (external → internal):",
                      watcher._sorted_items(watcher.per_host_in, now))
                 dump("Top countries (bytes / pkts):",
-                     [(b,p,c) for (b,p,c) in watcher._sorted_items(watcher.per_country, now)])
+                     [(b,p,c) for (b,p,c) in watcher._sorted_items(watcher.per_country, now, kind="country")])
                 print("\nTop domains (with categories):")
-                for b,p,dom in watcher._sorted_items(watcher.per_domain, now)[:10]:
+                for b,p,dom in watcher._sorted_items(watcher.per_domain, now, kind="domain")[:10]:
                     cat = watcher.categorize_domain(dom)
                     print(f"  {dom:<40.40} {b:>12,} / {p:>7}   [{cat}]")
                 if cfg.get('poll_states', False):
